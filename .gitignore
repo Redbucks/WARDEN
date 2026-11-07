@@ -1,0 +1,32 @@
+﻿# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output
+dist/
+**/dist/
+coverage/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local databases and runtime files
+*.db
+*.sqlite
+*.sqlite3
+**/data/*.db
+**/data/*.sqlite
+**/data/*.sqlite3
+
+# Backups and logs
+*.backup
+*.bak
+*.log
+
+# Compiled test output
+tests-dist/
+
+# Timestamped backups
+*.backup-*
