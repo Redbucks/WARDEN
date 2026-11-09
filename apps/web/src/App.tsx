@@ -189,36 +189,78 @@ function App() {
       setNearRpcBusy(false)
     }
   }
-  const refresh = useCallback(async () => {
-    setRefreshing(true)
-    try {
-      const [healthData, transferData, approvalData, executionData, auditData] =
-        await Promise.all([
-          apiRequest<Health>('/api/health'),
-          apiRequest<{ transfers: Transfer[] }>('/api/transfers'),
-          apiRequest<{ approvals: Approval[] }>('/api/approvals'),
-          apiRequest<{ executions: Execution[] }>('/api/executions'),
-          apiRequest<{ events: AuditEvent[] }>('/api/audit'),
-        ])
+  const loadDashboardData = useCallback(async () => {
+    const [healthData, transferData, approvalData, executionData, auditData] =
+      await Promise.all([
+        apiRequest<Health>('/api/health'),
+        apiRequest<{ transfers: Transfer[] }>('/api/transfers'),
+        apiRequest<{ approvals: Approval[] }>('/api/approvals'),
+        apiRequest<{ executions: Execution[] }>('/api/executions'),
+        apiRequest<{ events: AuditEvent[] }>('/api/audit'),
+      ])
 
-      setHealth(healthData)
-      setTransfers(transferData.transfers || [])
-      setApprovals(approvalData.approvals || [])
-      setExecutions(executionData.executions || [])
-      setEvents(auditData.events || [])
-      setError('')
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to connect to WARDEN API')
-    } finally {
-      setRefreshing(false)
+    return {
+      healthData,
+      transferData,
+      approvalData,
+      executionData,
+      auditData,
     }
   }, [])
 
+  const applyDashboardData = useCallback(
+    (data: Awaited<ReturnType<typeof loadDashboardData>>) => {
+      setHealth(data.healthData)
+      setTransfers(data.transferData.transfers || [])
+      setApprovals(data.approvalData.approvals || [])
+      setExecutions(data.executionData.executions || [])
+      setEvents(data.auditData.events || [])
+      setError('')
+    },
+    [],
+  )
+
+  const refresh = useCallback(async () => {
+    try {
+      const data = await loadDashboardData()
+      applyDashboardData(data)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to connect to WARDEN API')
+    }
+  }, [loadDashboardData, applyDashboardData])
+
+  async function refreshManually() {
+    setRefreshing(true)
+    try {
+      await refresh()
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
   useEffect(() => {
-    void refresh()
-    const interval = window.setInterval(() => void refresh(), 15000)
-    return () => window.clearInterval(interval)
-  }, [refresh])
+    let active = true
+
+    const load = () => {
+      void loadDashboardData()
+        .then((data) => {
+          if (active) applyDashboardData(data)
+        })
+        .catch((err: unknown) => {
+          if (active) {
+            setError(err instanceof Error ? err.message : 'Unable to connect to WARDEN API')
+          }
+        })
+    }
+
+    load()
+    const interval = window.setInterval(load, 15000)
+
+    return () => {
+      active = false
+      window.clearInterval(interval)
+    }
+  }, [loadDashboardData, applyDashboardData])
 
   useEffect(() => {
     const handleSignIn = (payload: {
@@ -304,7 +346,7 @@ function App() {
       })
 
       setNotice(`Approval #${id} ${decision === 'APPROVE' ? 'approved' : 'rejected'}. No transfer was executed.`)
-      await refresh()
+      await refreshManually()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Approval decision failed')
     } finally {
@@ -476,7 +518,7 @@ function App() {
               <h1>Control Centre</h1>
               <p>Monitor agent proposals, enforce policy boundaries, and review every decision.</p>
             </div>
-            <button className="refresh-button" onClick={() => void refresh()} disabled={refreshing}>
+            <button className="refresh-button" onClick={() => void refreshManually()} disabled={refreshing}>
               <RefreshCw size={16} className={refreshing ? 'spin' : ''} />
               {refreshing ? 'Refreshing' : 'Refresh data'}
             </button>
@@ -493,7 +535,7 @@ function App() {
             <div className="alert alert-error">
               <ShieldAlert size={18} />
               <div><strong>API connection issue</strong><span>{error}. Check that the WARDEN API is running on port 3001.</span></div>
-              <button onClick={() => void refresh()}>Retry</button>
+              <button onClick={() => void refreshManually()}>Retry</button>
             </div>
           )}
 
