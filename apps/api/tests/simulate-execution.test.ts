@@ -64,7 +64,13 @@ function startMockRpc(): Promise<number> {
 
       req.on("end", () => {
         let payload: {
-          params?: { account_id?: string };
+          method?: string;
+          params?: {
+            account_id?: string;
+            tx_hash?: string;
+            sender_account_id?: string;
+            wait_until?: string;
+          };
         };
 
         try {
@@ -75,6 +81,68 @@ function startMockRpc(): Promise<number> {
           return;
         }
 
+        res.setHeader("Content-Type", "application/json");
+
+        // Transaction lookup mock. No public RPC is contacted.
+        if (payload.method === "tx") {
+          const txHash = payload.params?.tx_hash ?? "";
+          const senderId =
+            payload.params?.sender_account_id ?? "warden-signer.testnet";
+
+          if (txHash.startsWith("3")) {
+            res.writeHead(503);
+            res.end("Mock transaction RPC unavailable");
+            return;
+          }
+
+          const result = {
+            final_execution_status: txHash.startsWith("2")
+              ? "EXECUTED"
+              : "FINAL",
+            transaction: {
+              hash: txHash,
+              signer_id: txHash.startsWith("4")
+                ? "wrong-signer.testnet"
+                : senderId,
+              receiver_id: txHash.startsWith("6")
+                ? "wrong-recipient.testnet"
+                : "tx-recipient.testnet",
+              actions: [{
+                Transfer: {
+                  deposit: txHash.startsWith("7")
+                    ? "6000000000000000000000"
+                    : "5000000000000000000000"
+                }
+              }]
+            },
+            transaction_outcome: {
+              outcome: {
+                status: txHash.startsWith("5")
+                  ? { Failure: { error_message: "Mock execution failure" } }
+                  : { SuccessReceiptId: "mock-success-receipt" }
+              }
+            },
+            receipts_outcome: [{
+              outcome: {
+                status: txHash.startsWith("5") || txHash.startsWith("8")
+                  ? { Failure: { error_message: "Mock receipt failure" } }
+                  : { SuccessValue: "" }
+              }
+            }],
+            status: txHash.startsWith("5")
+              ? { Failure: { error_message: "Mock execution failure" } }
+              : { SuccessValue: "" }
+          };
+
+          res.end(JSON.stringify({
+            jsonrpc: "2.0",
+            id: "warden-testnet-finality-verification",
+            result
+          }));
+          return;
+        }
+
+        // Existing read-only account verification mock.
         const accountId = payload.params?.account_id;
 
         if (accountId === "rpc-http-error.testnet") {
@@ -82,8 +150,6 @@ function startMockRpc(): Promise<number> {
           res.end("Mock RPC unavailable");
           return;
         }
-
-        res.setHeader("Content-Type", "application/json");
 
         if (accountId === "account-not-found.testnet") {
           res.end(JSON.stringify({
@@ -168,7 +234,8 @@ before(async () => {
       PORT: String(port),
       WARDEN_API_TOKEN: TEST_API_TOKEN,
       WARDEN_REVIEWER: TEST_REVIEWER,
-      NEAR_TESTNET_RPC_URL: `http://127.0.0.1:${rpcPort}`
+      NEAR_TESTNET_RPC_URL: `http://127.0.0.1:${rpcPort}`,
+      NEAR_TESTNET_TX_RPC_URL: `http://127.0.0.1:${rpcPort}`
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -1289,4 +1356,662 @@ test("exact NEAR amounts: approval and transfer store identical yoctoNEAR", asyn
 
   assert.equal(records.transfer.amount_yocto, "200000000000000000000000");
   assert.equal(records.approval.amount_yocto, records.transfer.amount_yocto);
+});
+
+
+// ---- on-chain execution intent tests ---------------------------------------
+
+function seedTrustedRecipient(accountId: string, status = "ACTIVE"): void {
+  withDb(db => {
+    db.prepare(`
+      INSERT OR IGNORE INTO trusted_recipients (
+        account_id, network, status, created_by
+      )
+      VALUES (?, 'testnet', ?, 'onchain-intent-test')
+    `).run(accountId, status);
+  });
+}
+
+async function createOnchainIntent(
+  transferId: number,
+  senderAccountId: unknown = "warden-signer.testnet"
+): Promise<SimResult> {
+  const response = await authorizedFetch(
+    `${baseUrl}/api/transfers/${transferId}/onchain-intent`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ senderAccountId })
+    }
+  );
+
+  return {
+    status: response.status,
+    body: await response.json() as Record<string, unknown>
+  };
+}
+
+function onchainIntentCount(transferId: number): number {
+  return withDb(db =>
+    Number((db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM onchain_executions
+      WHERE transfer_id = ?
+    `).get(transferId) as { count: number }).count)
+  );
+}
+
+async function submitOnchainExecution(
+  intentId: string,
+  txHash: string
+): Promise<SimResult> {
+  const response = await authorizedFetch(
+    `${baseUrl}/api/onchain-executions/${intentId}/submit`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ txHash })
+    }
+  );
+
+  return {
+    status: response.status,
+    body: await response.json() as Record<string, unknown>
+  };
+}
+
+function onchainExecutionState(intentId: string): {
+  state: string;
+  tx_hash: string | null;
+  failure_code: string | null;
+} {
+  return withDb(db =>
+    db.prepare(`
+      SELECT state, tx_hash, failure_code
+      FROM onchain_executions
+      WHERE intent_id = ?
+    `).get(intentId) as {
+      state: string;
+      tx_hash: string | null;
+      failure_code: string | null;
+    }
+  );
+}
+
+async function createTrustedTestnetIntent(
+  recipient = "tx-recipient.testnet"
+): Promise<{ transferId: number; intentId: string }> {
+  seedTrustedRecipient(recipient);
+
+  const transferId = seedTransfer({
+    decision: "ALLOW",
+    status: "AUTHORIZED",
+    amount: 0.005,
+    amountYocto: INTENT_AMOUNT_YOCTO,
+    currency: "NEAR",
+    recipient
+  });
+
+  const created = await createOnchainIntent(transferId);
+  assert.equal(created.status, 201);
+
+  const intent = created.body.intent as Record<string, unknown>;
+
+  return {
+    transferId,
+    intentId: intent.intentId as string
+  };
+}
+const INTENT_AMOUNT_YOCTO = "5000000000000000000000";
+
+// Verify an active trusted recipient can receive an authorized ALLOW intent.
+test("onchain intent: active trusted ALLOW transfer creates exact intent", async () => {
+  seedTrustedRecipient("intent-trusted.testnet");
+
+  const transferId = seedTransfer({
+    decision: "ALLOW",
+    status: "AUTHORIZED",
+    amount: 0.005,
+    amountYocto: INTENT_AMOUNT_YOCTO,
+    currency: "NEAR",
+    recipient: "intent-trusted.testnet"
+  });
+
+  const result = await createOnchainIntent(transferId);
+
+  assert.equal(result.status, 201);
+  assert.equal(result.body.success, true);
+  assert.equal(result.body.network, "testnet");
+
+  const intent = result.body.intent as Record<string, unknown>;
+  assert.equal(typeof intent.intentId, "string");
+  assert.equal(intent.transferId, transferId);
+  assert.equal(intent.senderAccountId, "warden-signer.testnet");
+  assert.equal(intent.receiverId, "intent-trusted.testnet");
+  assert.equal(intent.amountYocto, INTENT_AMOUNT_YOCTO);
+  assert.equal(intent.state, "CREATED");
+  assert.equal(typeof intent.expiresAt, "string");
+
+  const transaction = result.body.transaction as {
+    network: string;
+    signerId: string;
+    receiverId: string;
+    actions: Array<{
+      type: string;
+      params: { deposit: string };
+    }>;
+  };
+
+  assert.equal(transaction.network, "testnet");
+  assert.equal(transaction.signerId, "warden-signer.testnet");
+  assert.equal(transaction.receiverId, "intent-trusted.testnet");
+  assert.deepEqual(transaction.actions, [{
+    type: "Transfer",
+    params: { deposit: INTENT_AMOUNT_YOCTO }
+  }]);
+
+  assert.equal(onchainIntentCount(transferId), 1);
+  assert.equal(transferStatus(transferId), "AUTHORIZED");
+
+  const audit = auditEvents(
+    "ONCHAIN_EXECUTION_INTENT_CREATED",
+    transferId
+  );
+
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].intentId, intent.intentId);
+  assert.equal(audit[0].amountYocto, INTENT_AMOUNT_YOCTO);
+});
+
+// An unregistered recipient may proceed only with a matching human approval.
+test("onchain intent: matching human approval permits unregistered recipient", async () => {
+  const transferId = seedTransfer({
+    decision: "REQUIRES_APPROVAL",
+    status: "APPROVED",
+    amount: 0.005,
+    amountYocto: INTENT_AMOUNT_YOCTO,
+    currency: "NEAR",
+    recipient: "intent-unregistered.testnet"
+  });
+
+  seedApproval({
+    transferId,
+    status: "APPROVED",
+    amount: 0.005,
+    amountYocto: INTENT_AMOUNT_YOCTO,
+    currency: "NEAR",
+    recipient: "intent-unregistered.testnet"
+  });
+
+  const result = await createOnchainIntent(transferId);
+
+  assert.equal(result.status, 201);
+  assert.equal(result.body.success, true);
+  assert.equal(onchainIntentCount(transferId), 1);
+});
+
+// A revoked recipient cannot bypass revocation through human approval.
+test("onchain intent: revoked recipient is denied even with matching approval", async () => {
+  seedTrustedRecipient("intent-revoked.testnet", "REVOKED");
+
+  const transferId = seedTransfer({
+    decision: "REQUIRES_APPROVAL",
+    status: "APPROVED",
+    amount: 0.005,
+    amountYocto: INTENT_AMOUNT_YOCTO,
+    currency: "NEAR",
+    recipient: "intent-revoked.testnet"
+  });
+
+  seedApproval({
+    transferId,
+    status: "APPROVED",
+    amount: 0.005,
+    amountYocto: INTENT_AMOUNT_YOCTO,
+    currency: "NEAR",
+    recipient: "intent-revoked.testnet"
+  });
+
+  const result = await createOnchainIntent(transferId);
+
+  assert.equal(result.status, 409);
+  assert.equal(result.body.error, "RECIPIENT_TRUST_REVOKED");
+  assert.equal(onchainIntentCount(transferId), 0);
+});
+
+// A transfer cannot create an intent while approval is pending.
+test("onchain intent: pending approval is denied", async () => {
+  const transferId = seedTransfer({
+    decision: "REQUIRES_APPROVAL",
+    status: "AWAITING_APPROVAL",
+    amount: 0.005,
+    amountYocto: INTENT_AMOUNT_YOCTO,
+    currency: "NEAR",
+    recipient: "intent-pending.testnet"
+  });
+
+  seedApproval({
+    transferId,
+    status: "PENDING",
+    amount: 0.005,
+    amountYocto: INTENT_AMOUNT_YOCTO,
+    currency: "NEAR",
+    recipient: "intent-pending.testnet"
+  });
+
+  const result = await createOnchainIntent(transferId);
+
+  assert.equal(result.status, 403);
+  assert.equal(result.body.error, "TRANSFER_NOT_AUTHORIZED");
+  assert.equal(onchainIntentCount(transferId), 0);
+});
+
+// Approval must match the exact yoctoNEAR amount.
+test("onchain intent: mismatched approval amount is denied", async () => {
+  const transferId = seedTransfer({
+    decision: "REQUIRES_APPROVAL",
+    status: "APPROVED",
+    amount: 0.005,
+    amountYocto: INTENT_AMOUNT_YOCTO,
+    currency: "NEAR",
+    recipient: "intent-mismatch.testnet"
+  });
+
+  seedApproval({
+    transferId,
+    status: "APPROVED",
+    amount: 0.005,
+    amountYocto: "6000000000000000000000",
+    currency: "NEAR",
+    recipient: "intent-mismatch.testnet"
+  });
+
+  const result = await createOnchainIntent(transferId);
+
+  assert.equal(result.status, 403);
+  assert.equal(result.body.error, "MATCHING_APPROVAL_REQUIRED");
+  assert.equal(onchainIntentCount(transferId), 0);
+});
+
+// Sender must be a valid named Testnet account.
+test("onchain intent: malformed sender is rejected before RPC lookup", async () => {
+  const transferId = seedTransfer({
+    decision: "ALLOW",
+    status: "AUTHORIZED",
+    amount: 0.005,
+    amountYocto: INTENT_AMOUNT_YOCTO,
+    currency: "NEAR",
+    recipient: "intent-invalid-sender.testnet"
+  });
+
+  seedTrustedRecipient("intent-invalid-sender.testnet");
+
+  const result = await createOnchainIntent(transferId, "not-a-testnet-account");
+
+  assert.equal(result.status, 400);
+  assert.equal(result.body.error, "INVALID_SENDER_ACCOUNT");
+  assert.equal(onchainIntentCount(transferId), 0);
+});
+
+// Sender account verification must fail closed when RPC is unavailable.
+test("onchain intent: sender RPC failure prevents intent creation", async () => {
+  const transferId = seedTransfer({
+    decision: "ALLOW",
+    status: "AUTHORIZED",
+    amount: 0.005,
+    amountYocto: INTENT_AMOUNT_YOCTO,
+    currency: "NEAR",
+    recipient: "intent-rpc-failure.testnet"
+  });
+
+  seedTrustedRecipient("intent-rpc-failure.testnet");
+
+  const result = await createOnchainIntent(
+    transferId,
+    "rpc-error.testnet"
+  );
+
+  assert.equal(result.status, 502);
+  assert.equal(result.body.error, "NEAR_RPC_QUERY_FAILED");
+  assert.equal(onchainIntentCount(transferId), 0);
+});
+
+// A transfer can have only one intent, even if the first request is repeated.
+test("onchain intent: duplicate creation is rejected", async () => {
+  seedTrustedRecipient("intent-duplicate.testnet");
+
+  const transferId = seedTransfer({
+    decision: "ALLOW",
+    status: "AUTHORIZED",
+    amount: 0.005,
+    amountYocto: INTENT_AMOUNT_YOCTO,
+    currency: "NEAR",
+    recipient: "intent-duplicate.testnet"
+  });
+
+  const first = await createOnchainIntent(transferId);
+  assert.equal(first.status, 201);
+
+  const second = await createOnchainIntent(transferId);
+
+  assert.equal(second.status, 409);
+  assert.equal(second.body.error, "ONCHAIN_INTENT_ALREADY_EXISTS");
+  assert.equal(onchainIntentCount(transferId), 1);
+});
+
+// Simulation and real Testnet intent are mutually exclusive for one transfer.
+test("onchain intent: previously simulated transfer cannot create intent", async () => {
+  seedTrustedRecipient("intent-simulated.testnet");
+
+  const transferId = seedTransfer({
+    decision: "ALLOW",
+    status: "AUTHORIZED",
+    amount: 0.005,
+    amountYocto: INTENT_AMOUNT_YOCTO,
+    currency: "NEAR",
+    recipient: "intent-simulated.testnet"
+  });
+
+  const simulation = await simulate(transferId);
+  assert.equal(simulation.status, 200);
+  assert.equal(simulation.body.realFundsMoved, false);
+
+  const result = await createOnchainIntent(transferId);
+
+  assert.equal(result.status, 409);
+  assert.equal(result.body.error, "TRANSFER_ALREADY_SIMULATED");
+  assert.equal(onchainIntentCount(transferId), 0);
+});
+
+// Invalid and nonexistent transfer IDs are rejected.
+test("onchain intent: invalid and missing transfer IDs are rejected", async () => {
+  const invalid = await authorizedFetch(
+    `${baseUrl}/api/transfers/abc/onchain-intent`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        senderAccountId: "warden-signer.testnet"
+      })
+    }
+  );
+
+  assert.equal(invalid.status, 400);
+  assert.equal(
+    ((await invalid.json()) as Record<string, unknown>).error,
+    "INVALID_TRANSFER_ID"
+  );
+
+  const missing = await createOnchainIntent(999999);
+
+  assert.equal(missing.status, 404);
+  assert.equal(missing.body.error, "TRANSFER_NOT_FOUND");
+});
+
+// ---- on-chain Testnet submission verification tests -----------------------
+
+// A matching transaction must be finalized and independently verified.
+test("onchain submission: finalized matching transaction", async () => {
+  const { transferId, intentId } = await createTrustedTestnetIntent();
+  const txHash = "A" + "A".repeat(42);
+
+  const result = await submitOnchainExecution(intentId, txHash);
+
+  assert.equal(result.status, 200);
+  assert.equal(result.body.state, "VERIFIED");
+  assert.equal(result.body.onchainConfirmed, true);
+  assert.equal(result.body.txHash, txHash);
+  assert.equal(result.body.network, "testnet");
+
+  const stored = onchainExecutionState(intentId);
+  assert.equal(stored.state, "VERIFIED");
+  assert.equal(stored.tx_hash, txHash);
+  assert.equal(stored.failure_code, null);
+
+  assert.equal(
+    auditEvents("ONCHAIN_TRANSACTION_HASH_RECEIVED", transferId).length,
+    1
+  );
+  assert.equal(
+    auditEvents("ONCHAIN_EXECUTION_VERIFIED", transferId).length,
+    1
+  );
+
+  // Repeating the same finalized transaction is idempotent.
+  const repeated = await submitOnchainExecution(intentId, txHash);
+
+  assert.equal(repeated.status, 200);
+  assert.equal(repeated.body.state, "VERIFIED");
+  assert.equal(repeated.body.idempotent, true);
+  assert.equal(
+    auditEvents("ONCHAIN_EXECUTION_VERIFIED", transferId).length,
+    1
+  );
+});
+
+// The intent is permanently bound to the first submitted transaction hash.
+test("onchain submission: transaction hash cannot be replaced", async () => {
+  const { intentId } = await createTrustedTestnetIntent();
+  const originalHash = "B" + "B".repeat(42);
+  const replacementHash = "C" + "C".repeat(42);
+
+  const first = await submitOnchainExecution(intentId, originalHash);
+  assert.equal(first.status, 200);
+
+  const replacement = await submitOnchainExecution(
+    intentId,
+    replacementHash
+  );
+
+  assert.equal(replacement.status, 409);
+  assert.equal(replacement.body.error, "TRANSACTION_HASH_MISMATCH");
+
+  const stored = onchainExecutionState(intentId);
+  assert.equal(stored.tx_hash, originalHash);
+  assert.equal(stored.state, "VERIFIED");
+});
+
+// Wrong signer, recipient, or exact yoctoNEAR deposit must fail closed.
+test("onchain submission: transaction intent mismatches are rejected", async () => {
+  const cases = [
+    {
+      label: "wrong signer",
+      hash: "4" + "D".repeat(42)
+    },
+    {
+      label: "wrong recipient",
+      hash: "6" + "E".repeat(42)
+    },
+    {
+      label: "wrong exact amount",
+      hash: "7" + "F".repeat(42)
+    }
+  ];
+
+  for (const item of cases) {
+    const { intentId } = await createTrustedTestnetIntent();
+
+    const result = await submitOnchainExecution(intentId, item.hash);
+
+    assert.equal(result.status, 409, item.label);
+    assert.equal(
+      result.body.error,
+      "TRANSACTION_INTENT_MISMATCH",
+      item.label
+    );
+    assert.equal(result.body.state, "FAILED", item.label);
+    assert.equal(result.body.onchainConfirmed, false, item.label);
+
+    const stored = onchainExecutionState(intentId);
+    assert.equal(stored.state, "FAILED", item.label);
+    assert.equal(
+      stored.failure_code,
+      "TRANSACTION_INTENT_MISMATCH",
+      item.label
+    );
+  }
+});
+
+// A finalized transaction with failed execution or receipt outcomes is rejected.
+test("onchain submission: failed NEAR execution is rejected", async () => {
+  const { intentId } = await createTrustedTestnetIntent();
+  const txHash = "5" + "G".repeat(42);
+
+  const result = await submitOnchainExecution(intentId, txHash);
+
+  assert.equal(result.status, 409);
+  assert.equal(result.body.error, "TRANSACTION_EXECUTION_FAILED");
+  assert.equal(result.body.state, "FAILED");
+  assert.equal(result.body.onchainConfirmed, false);
+
+  const stored = onchainExecutionState(intentId);
+  assert.equal(stored.state, "FAILED");
+  assert.equal(stored.failure_code, "TRANSACTION_EXECUTION_FAILED");
+});
+
+// A successful transaction with a failed receipt must still be rejected.
+test("onchain submission: failed receipt is rejected independently", async () => {
+  const { intentId } = await createTrustedTestnetIntent();
+  const txHash = "8" + "J".repeat(42);
+
+  const result = await submitOnchainExecution(intentId, txHash);
+
+  assert.equal(result.status, 409);
+  assert.equal(result.body.error, "TRANSACTION_EXECUTION_FAILED");
+  assert.equal(result.body.state, "FAILED");
+  assert.equal(result.body.onchainConfirmed, false);
+
+  const stored = onchainExecutionState(intentId);
+  assert.equal(stored.state, "FAILED");
+  assert.equal(stored.failure_code, "TRANSACTION_EXECUTION_FAILED");
+});
+
+// A transaction that has not reached FINAL remains SUBMITTED, not VERIFIED.
+test("onchain submission: non-final transaction remains retryable", async () => {
+  const { intentId } = await createTrustedTestnetIntent();
+  const txHash = "2" + "H".repeat(42);
+
+  const result = await submitOnchainExecution(intentId, txHash);
+
+  assert.equal(result.status, 202);
+  assert.equal(result.body.state, "SUBMITTED");
+  assert.equal(result.body.onchainConfirmed, false);
+
+  const stored = onchainExecutionState(intentId);
+  assert.equal(stored.state, "SUBMITTED");
+  assert.equal(stored.tx_hash, txHash);
+  assert.equal(stored.failure_code, null);
+});
+
+// Temporary RPC failure preserves the original hash and allows safe retry.
+test("onchain submission: RPC outage preserves submitted state", async () => {
+  const { intentId } = await createTrustedTestnetIntent();
+  const txHash = "3" + "J".repeat(42);
+
+  const result = await submitOnchainExecution(intentId, txHash);
+
+  assert.equal(result.status, 502);
+  assert.equal(result.body.error, "NEAR_TX_RPC_HTTP_ERROR");
+  assert.equal(result.body.state, "SUBMITTED");
+  assert.equal(result.body.retryable, true);
+
+  const stored = onchainExecutionState(intentId);
+  assert.equal(stored.state, "SUBMITTED");
+  assert.equal(stored.tx_hash, txHash);
+  assert.equal(stored.failure_code, null);
+
+  // The same hash may be retried; a different hash may not.
+  const retry = await submitOnchainExecution(intentId, txHash);
+  assert.equal(retry.status, 502);
+  assert.equal(retry.body.state, "SUBMITTED");
+
+  const replacement = await submitOnchainExecution(
+    intentId,
+    "K" + "K".repeat(42)
+  );
+  assert.equal(replacement.status, 409);
+  assert.equal(replacement.body.error, "TRANSACTION_HASH_MISMATCH");
+});
+
+// Invalid transaction hashes must not bind or mutate an intent.
+test("onchain submission: malformed transaction hash is rejected", async () => {
+  const { intentId } = await createTrustedTestnetIntent();
+
+  const result = await submitOnchainExecution(intentId, "not-a-valid-hash");
+
+  assert.equal(result.status, 400);
+  assert.equal(result.body.error, "INVALID_TRANSACTION_HASH");
+
+  const stored = onchainExecutionState(intentId);
+  assert.equal(stored.state, "CREATED");
+  assert.equal(stored.tx_hash, null);
+});
+
+// An expired, unused intent cannot be submitted.
+test("onchain submission: expired intent cannot be submitted", async () => {
+  const { intentId } = await createTrustedTestnetIntent();
+
+  withDb(db => {
+    db.prepare(`
+      UPDATE onchain_executions
+      SET expires_at = ?
+      WHERE intent_id = ?
+    `).run("2000-01-01T00:00:00.000Z", intentId);
+  });
+
+  const result = await submitOnchainExecution(
+    intentId,
+    "L" + "L".repeat(42)
+  );
+
+  assert.equal(result.status, 410);
+  assert.equal(result.body.error, "ONCHAIN_INTENT_EXPIRED");
+
+  const stored = onchainExecutionState(intentId);
+  assert.equal(stored.state, "EXPIRED");
+  assert.equal(stored.tx_hash, null);
+
+  // Retrying an already-expired, unbound intent must still return 410.
+  const retry = await submitOnchainExecution(
+    intentId,
+    "M" + "M".repeat(42)
+  );
+
+  assert.equal(retry.status, 410);
+  assert.equal(retry.body.error, "ONCHAIN_INTENT_EXPIRED");
+
+  const afterRetry = onchainExecutionState(intentId);
+  assert.equal(afterRetry.state, "EXPIRED");
+  assert.equal(afterRetry.tx_hash, null);
+});
+// Transfers API must expose the persisted on-chain state after finality verification.
+test("transfers API: exposes persisted verified on-chain execution details", async () => {
+  const { transferId, intentId } = await createTrustedTestnetIntent();
+
+  const txHash = "N" + "N".repeat(42);
+  const submitted = await submitOnchainExecution(intentId, txHash);
+
+  assert.equal(submitted.status, 200);
+  assert.equal(submitted.body.state, "VERIFIED");
+
+  const response = await authorizedFetch(`${baseUrl}/api/transfers`);
+  assert.equal(response.status, 200);
+
+  const body = await response.json() as {
+    success: boolean;
+    transfers: Array<Record<string, unknown>>;
+  };
+
+  assert.equal(body.success, true);
+
+  const transfer = body.transfers.find(
+    item => item.id === transferId
+  );
+
+  assert.ok(transfer, "transfer should be returned by the transfers endpoint");
+  assert.equal(transfer.onchain_intent_id, intentId);
+  assert.equal(transfer.onchain_state, "VERIFIED");
+  assert.equal(transfer.onchain_tx_hash, txHash);
+  assert.equal(transfer.onchain_failure_code, null);
+  assert.ok(transfer.onchain_finalized_at);
 });

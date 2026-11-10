@@ -21,6 +21,9 @@ import {
 import { NearConnector } from '@hot-labs/near-connect'
 import './App.css'
 
+const isExecutionIntentExpired = (expiresAt: string): boolean =>
+  Date.parse(expiresAt) <= Date.now()
+
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3001'
 
 const nearConnector = new NearConnector({
@@ -68,6 +71,47 @@ type Transfer = {
   status: string
   approval_id: number | null
   created_at: string
+  onchain_intent_id: string | null
+  onchain_state: 'CREATED' | 'SUBMITTED' | 'VERIFIED' | 'FAILED' | 'EXPIRED' | null
+  onchain_tx_hash: string | null
+  onchain_failure_code: string | null
+  onchain_finalized_at: string | null
+}
+
+type OnchainIntentResponse = {
+  success: boolean
+  network: string
+  intent: {
+    intentId: string
+    transferId: number
+    senderAccountId: string
+    receiverId: string
+    amountYocto: string
+    expiresAt: string
+    state: string
+  }
+  transaction: {
+    network: string
+    signerId: string
+    receiverId: string
+    actions: Array<{
+      type: string
+      params: { deposit: string }
+    }>
+  }
+}
+
+type OnchainVerificationResponse = {
+  success: boolean
+  state: string
+  onchainConfirmed?: boolean
+  message?: string
+}
+
+type PendingOnchainVerification = {
+  transferId: number
+  intentId: string
+  txHash: string
 }
 
 type Approval = {
@@ -190,6 +234,8 @@ function App() {
   const [proposalAmount, setProposalAmount] = useState('')
   const [proposalRecipient, setProposalRecipient] = useState('')
   const [proposalBusy, setProposalBusy] = useState(false)
+  const [onchainBusyTransferId, setOnchainBusyTransferId] = useState<number | null>(null)
+  const [pendingOnchain, setPendingOnchain] = useState<PendingOnchainVerification | null>(null)
 
   const nearRpcBusy = Boolean(apiToken && walletConnection?.accountId && !nearAccountSnapshot && !nearRpcError)
 
@@ -205,6 +251,7 @@ function App() {
     setNotice('')
     setNearAccountSnapshot(null)
     setNearRpcError('')
+    setPendingOnchain(null)
     setAuthError(message)
   }, [])
 
@@ -437,6 +484,214 @@ function App() {
 
   const blockedCount = transfers.filter((item) => item.status === 'BLOCKED').length
   const simulatedCount = executions.length
+
+  async function verifyOnchainTransaction(
+    intentId: string,
+    txHash: string,
+    transferId: number,
+  ) {
+    const result = await apiRequest<OnchainVerificationResponse>(
+      `/api/onchain-executions/${encodeURIComponent(intentId)}/submit`,
+      apiToken,
+      {
+        method: 'POST',
+        body: JSON.stringify({ txHash }),
+      },
+    )
+
+    if (result.state === 'VERIFIED' && result.onchainConfirmed === true) {
+      setPendingOnchain(null)
+      setNotice(`Transfer #${transferId} independently verified on NEAR Testnet. Transaction: ${txHash}`)
+      await refreshManually()
+      return
+    }
+
+    if (result.state === 'SUBMITTED') {
+      setNotice(`Transfer #${transferId}: transaction hash recorded. Finality verification is still pending. Use Retry verification to check again.`)
+      return
+    }
+
+    throw new Error(result.message || `Unexpected on-chain verification state: ${result.state}`)
+  }
+
+  async function executeOnchainTransfer(transfer: Transfer) {
+    if (!walletConnection?.accountId) {
+      setError('Connect a NEAR Testnet wallet before requesting execution.')
+      return
+    }
+
+    if (
+      !nearAccountSnapshot ||
+      nearAccountSnapshot.network !== 'testnet' ||
+      nearAccountSnapshot.accountId !== walletConnection.accountId
+    ) {
+      setError('The connected wallet account must be verified against the Testnet RPC first.')
+      return
+    }
+
+    const eligible =
+      (transfer.policy_decision === 'ALLOW' && transfer.status === 'AUTHORIZED') ||
+      (transfer.policy_decision === 'REQUIRES_APPROVAL' && transfer.status === 'APPROVED')
+
+    if (!eligible || transfer.currency !== 'NEAR') {
+      setError('This transfer is not eligible for the NEAR Testnet execution flow.')
+      return
+    }
+
+    if (transfer.onchain_intent_id) {
+      setError('This transfer already has an on-chain execution intent. Review its persisted status; do not create another transaction.')
+      return
+    }
+
+    if (pendingOnchain) {
+      setError('Verify or resolve the existing pending transaction before starting another.')
+      return
+    }
+
+    const confirmed = window.confirm(
+      `NEAR TESTNET TRANSFER CONFIRMATION\n\n` +
+      `Transfer: #${transfer.id}\n` +
+      `Network: NEAR Testnet\n` +
+      `From: ${walletConnection.accountId}\n` +
+      `To: ${transfer.recipient}\n` +
+      `Amount: ${money(transfer.amount, 'NEAR')}\n\n` +
+      `WARDEN will request a server-validated execution intent, then open your wallet for its own transaction approval.\n\n` +
+      `This is NOT Mainnet. Continue?`,
+    )
+
+    if (!confirmed) return
+
+    setOnchainBusyTransferId(transfer.id)
+    setError('')
+    setNotice('')
+
+    try {
+      const connected = await nearConnector.getConnectedWallet()
+      const account = connected.accounts.find(
+        (item) => item.accountId === walletConnection.accountId,
+      )
+
+      if (!account) {
+        throw new Error('The connected wallet account changed. Reconnect the intended Testnet account.')
+      }
+
+      const features = connected.wallet.manifest.features
+
+      if (!features.testnet || !features.signAndSendTransaction) {
+        throw new Error('The connected wallet does not advertise both Testnet and single-transaction signing support.')
+      }
+
+      const intentResponse = await apiRequest<OnchainIntentResponse>(
+        `/api/transfers/${transfer.id}/onchain-intent`,
+        apiToken,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            senderAccountId: account.accountId,
+          }),
+        },
+      )
+
+      const { intent, transaction } = intentResponse
+
+      if (
+        !intentResponse.success ||
+        intentResponse.network !== 'testnet' ||
+        transaction.network !== 'testnet' ||
+        intent.state !== 'CREATED' ||
+        intent.transferId !== transfer.id ||
+        intent.senderAccountId !== account.accountId ||
+        transaction.signerId !== account.accountId ||
+        intent.receiverId !== transfer.recipient ||
+        transaction.receiverId !== transfer.recipient ||
+        !/^[1-9]\d*$/.test(intent.amountYocto) ||
+        transaction.actions.length !== 1 ||
+        transaction.actions[0].type !== 'Transfer' ||
+        transaction.actions[0].params.deposit !== intent.amountYocto ||
+        !Number.isFinite(Date.parse(intent.expiresAt)) ||
+        isExecutionIntentExpired(intent.expiresAt)
+      ) {
+        throw new Error('WARDEN returned an invalid or mismatched execution intent. Wallet signing was stopped.')
+      }
+
+      // Construct the wallet request from validated server data.
+      // Never pass arbitrary API-provided action types to the wallet.
+      const outcome = await connected.wallet.signAndSendTransaction({
+        network: 'testnet',
+        signerId: account.accountId,
+        receiverId: intent.receiverId,
+        actions: [{
+          type: 'Transfer',
+          params: {
+            deposit: intent.amountYocto,
+          },
+        }],
+      })
+
+      const txHash = outcome.transaction?.hash
+
+      if (
+        typeof txHash !== 'string' ||
+        !/^[1-9A-HJ-NP-Za-km-z]{43,44}$/.test(txHash)
+      ) {
+        throw new Error('The wallet response did not contain a valid NEAR transaction hash. Check the wallet activity before retrying.')
+      }
+
+      const pending = {
+        transferId: transfer.id,
+        intentId: intent.intentId,
+        txHash,
+      }
+
+      setPendingOnchain(pending)
+      setNotice(`Wallet returned transaction hash for transfer #${transfer.id}. WARDEN is checking Testnet finality.`)
+
+      await verifyOnchainTransaction(
+        pending.intentId,
+        pending.txHash,
+        pending.transferId,
+      )
+    } catch (err) {
+      if (err instanceof ApiAuthError) {
+        clearAuthenticatedSession('Your WARDEN API session expired. Sign in again.')
+      } else {
+        setError(err instanceof Error ? err.message : 'NEAR Testnet execution request failed.')
+      }
+    } finally {
+      setOnchainBusyTransferId(null)
+    }
+  }
+
+  async function retryOnchainVerification(transfer: Transfer) {
+    if (
+      transfer.onchain_state !== 'SUBMITTED' ||
+      !transfer.onchain_intent_id ||
+      !transfer.onchain_tx_hash
+    ) {
+      setError('This transfer has no persisted submitted transaction available for verification.')
+      return
+    }
+
+    setOnchainBusyTransferId(transfer.id)
+    setError('')
+    setNotice('Retrying independent NEAR Testnet finality verification…')
+
+    try {
+      await verifyOnchainTransaction(
+        transfer.onchain_intent_id,
+        transfer.onchain_tx_hash,
+        transfer.id,
+      )
+    } catch (err) {
+      if (err instanceof ApiAuthError) {
+        clearAuthenticatedSession('Your WARDEN API session expired. Sign in again.')
+      } else {
+        setError(err instanceof Error ? err.message : 'Transaction verification retry failed.')
+      }
+    } finally {
+      setOnchainBusyTransferId(null)
+    }
+  }
 
   async function decideApproval(id: number, decision: 'APPROVE' | 'REJECT') {
     setBusyApproval(id)
@@ -851,7 +1106,7 @@ function App() {
               </div>
               <div className="gate-status">
                 <div className="gate-check"><ShieldCheck size={27} /></div>
-                <div><strong>Simulation mode enabled</strong><span>Real transaction submission is disabled.</span></div>
+                <div><strong>Simulation mode remains available</strong><span>Simulation is local-only. Separate Testnet transfers require explicit wallet approval.</span></div>
               </div>
               <div className="gate-rules">
                 <div><CheckCircle2 size={15} /><span>Policy decision checked before execution</span></div>
@@ -973,7 +1228,7 @@ function App() {
             ) : (
               <div className="table-wrap">
                 <table>
-                  <thead><tr><th>TRANSFER ID</th><th>AMOUNT</th><th>RECIPIENT</th><th>POLICY DECISION</th><th>STATUS</th><th>APPROVAL</th></tr></thead>
+                  <thead><tr><th>TRANSFER ID</th><th>AMOUNT</th><th>RECIPIENT</th><th>POLICY DECISION</th><th>STATUS</th><th>APPROVAL</th><th>TESTNET ACTION</th></tr></thead>
                   <tbody>
                     {transfers.map((transfer) => (
                       <tr key={transfer.id}>
@@ -983,6 +1238,89 @@ function App() {
                         <td><StatusPill value={transfer.policy_decision} /></td>
                         <td><StatusPill value={transfer.status} /></td>
                         <td>{transfer.approval_id ? `#${transfer.approval_id}` : '—'}</td>
+                        <td>
+                          {transfer.onchain_state === 'VERIFIED' ? (
+                            <div>
+                              <StatusPill value="VERIFIED ON-CHAIN" />
+                              {transfer.onchain_tx_hash ? (
+                                <div>
+                                  <a
+                                    href={`https://testnet.nearblocks.io/txns/${encodeURIComponent(transfer.onchain_tx_hash)}`}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                  >
+                                    View transaction
+                                  </a>
+                                </div>
+                              ) : null}
+                            </div>
+                          ) : transfer.onchain_state === 'SUBMITTED' && transfer.onchain_tx_hash ? (
+                            <div>
+                              <StatusPill value="SUBMITTED" />
+                              <button
+                                className="wallet-button"
+                                disabled={onchainBusyTransferId !== null}
+                                onClick={() => void retryOnchainVerification(transfer)}
+                              >
+                                {onchainBusyTransferId === transfer.id ? 'Checking…' : 'Retry verification'}
+                              </button>
+                              <div>
+                                <a
+                                  href={`https://testnet.nearblocks.io/txns/${encodeURIComponent(transfer.onchain_tx_hash)}`}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                >
+                                  View transaction
+                                </a>
+                              </div>
+                            </div>
+                          ) : transfer.onchain_state ? (
+                            <div>
+                              <StatusPill value={`ON-CHAIN ${transfer.onchain_state}`} />
+                              {transfer.onchain_tx_hash ? (
+                                <div>
+                                  <a
+                                    href={`https://testnet.nearblocks.io/txns/${encodeURIComponent(transfer.onchain_tx_hash)}`}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                  >
+                                    View transaction
+                                  </a>
+                                </div>
+                              ) : null}
+                              {transfer.onchain_failure_code ? (
+                                <div className="muted-cell">{transfer.onchain_failure_code}</div>
+                              ) : null}
+                            </div>
+                          ) : (
+                            (
+                              (transfer.policy_decision === 'ALLOW' && transfer.status === 'AUTHORIZED') ||
+                              (transfer.policy_decision === 'REQUIRES_APPROVAL' && transfer.status === 'APPROVED')
+                            ) && transfer.currency === 'NEAR'
+                          ) ? (
+                            <button
+                              className="wallet-button"
+                              disabled={
+                                !walletConnection ||
+                                !nearAccountSnapshot ||
+                                onchainBusyTransferId !== null ||
+                                pendingOnchain !== null
+                              }
+                              title={
+                                !walletConnection
+                                  ? 'Connect a NEAR Testnet wallet first'
+                                  : !nearAccountSnapshot
+                                    ? 'Wait for Testnet RPC account verification'
+                                    : 'Request explicit wallet approval for this Testnet transfer'
+                              }
+                              onClick={() => void executeOnchainTransfer(transfer)}
+                            >
+                              {onchainBusyTransferId === transfer.id ? 'Check wallet…' : 'Execute on Testnet'}
+                            </button>
+                          ) : (
+                            <span className="muted-cell">Not eligible</span>
+                          )}
+                        </td>
                       </tr>
                     ))}
                   </tbody>

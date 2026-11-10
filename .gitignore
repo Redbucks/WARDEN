@@ -30,3 +30,8 @@ tests-dist/
 
 # Timestamped backups
 *.backup-*
+
+# Local backup directories and timestamped source backups
+/backups/
+*.authfix-*
+*.onchain-*

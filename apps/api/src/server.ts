@@ -1,5 +1,5 @@
 import express from "express";
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import cors from "cors";
 import dotenv from "dotenv";
 import { evaluateTransferPolicy, parseNearAmount } from "./policy/PolicyEngine.js";
@@ -154,6 +154,27 @@ db.exec(`
     CHECK (account_id = lower(account_id))
   );
 `);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS onchain_executions (
+    intent_id TEXT PRIMARY KEY,
+    transfer_id INTEGER NOT NULL UNIQUE,
+    tx_hash TEXT UNIQUE,
+    sender_account_id TEXT NOT NULL,
+    recipient TEXT NOT NULL,
+    amount_yocto TEXT NOT NULL,
+    state TEXT NOT NULL
+      CHECK (state IN ('CREATED', 'SUBMITTED', 'VERIFIED', 'FAILED', 'EXPIRED')),
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    submitted_at TEXT,
+    finalized_at TEXT,
+    failure_code TEXT,
+    FOREIGN KEY (transfer_id) REFERENCES transfer_requests(id)
+  );
+`);
+const NEAR_TESTNET_TX_RPC_URL =
+  process.env.NEAR_TESTNET_TX_RPC_URL ??
+  "https://archival-rpc.testnet.fastnear.com";
 const NEAR_TESTNET_RPC_URL =
   process.env.NEAR_TESTNET_RPC_URL ?? "https://rpc.testnet.near.org";
 
@@ -593,9 +614,15 @@ app.get("/api/transfers", (_req, res) => {
       t.status,
       t.created_at,
       a.id AS approval_id,
-      a.status AS approval_status
+      a.status AS approval_status,
+      o.intent_id AS onchain_intent_id,
+      o.state AS onchain_state,
+      o.tx_hash AS onchain_tx_hash,
+      o.failure_code AS onchain_failure_code,
+      o.finalized_at AS onchain_finalized_at
     FROM transfer_requests t
     LEFT JOIN approvals a ON a.transfer_id = t.id
+    LEFT JOIN onchain_executions o ON o.transfer_id = t.id
     ORDER BY t.id DESC
     LIMIT 100
   `).all();
@@ -772,6 +799,663 @@ app.post("/api/approvals/:id/decision", (req, res) => {
   });
 });
 
+
+// Create a wallet-signing intent for an authorized NEAR Testnet transfer.
+// This route never signs or submits a transaction.
+app.post("/api/transfers/:id/onchain-intent", async (req, res) => {
+  const transferId = Number(req.params.id);
+  const rawSender = req.body?.senderAccountId;
+
+  if (!Number.isSafeInteger(transferId) || transferId <= 0) {
+    return res.status(400).json({
+      success: false,
+      error: "INVALID_TRANSFER_ID"
+    });
+  }
+
+  if (typeof rawSender !== "string") {
+    return res.status(400).json({
+      success: false,
+      error: "INVALID_SENDER_ACCOUNT",
+      message: "Provide the connected NEAR Testnet sender account ID."
+    });
+  }
+
+  const senderAccountId = rawSender.trim().toLowerCase();
+
+  if (!isNamedTestnetAccount(senderAccountId)) {
+    return res.status(400).json({
+      success: false,
+      error: "INVALID_SENDER_ACCOUNT",
+      message: "The sender must be a named NEAR Testnet account."
+    });
+  }
+
+  const senderVerification =
+    await verifyNearTestnetAccount(senderAccountId);
+
+  if (!senderVerification.success) {
+    return res.status(senderVerification.status).json({
+      success: false,
+      error: senderVerification.error,
+      message: "The wallet sender could not be verified on NEAR Testnet."
+    });
+  }
+
+  const intentId = randomUUID();
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+  db.exec("BEGIN IMMEDIATE");
+
+  try {
+    const transfer = db.prepare(`
+      SELECT
+        id,
+        amount_yocto,
+        currency,
+        recipient,
+        policy_decision,
+        status
+      FROM transfer_requests
+      WHERE id = ?
+    `).get(transferId) as
+      | {
+          id: number;
+          amount_yocto: string | null;
+          currency: string | null;
+          recipient: string | null;
+          policy_decision: string;
+          status: string;
+        }
+      | undefined;
+
+    if (!transfer) {
+      db.exec("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        error: "TRANSFER_NOT_FOUND"
+      });
+    }
+
+    if (
+      transfer.currency !== "NEAR" ||
+      typeof transfer.amount_yocto !== "string" ||
+      !/^[1-9]\d*$/.test(transfer.amount_yocto) ||
+      typeof transfer.recipient !== "string" ||
+      !isNamedTestnetAccount(transfer.recipient) ||
+      transfer.recipient !== transfer.recipient.toLowerCase()
+    ) {
+      db.exec("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        error: "TRANSFER_NOT_ONCHAIN_ELIGIBLE",
+        message: "The transfer does not contain a valid exact NEAR Testnet amount and recipient."
+      });
+    }
+
+    const simulated = db.prepare(`
+      SELECT id
+      FROM simulated_executions
+      WHERE transfer_id = ?
+    `).get(transferId);
+
+    if (simulated || transfer.status === "SIMULATED_EXECUTED") {
+      db.exec("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        error: "TRANSFER_ALREADY_SIMULATED",
+        message: "A simulated transfer cannot subsequently be submitted on-chain."
+      });
+    }
+
+    const existingIntent = db.prepare(`
+      SELECT intent_id, state
+      FROM onchain_executions
+      WHERE transfer_id = ?
+    `).get(transferId) as
+      | { intent_id: string; state: string }
+      | undefined;
+
+    if (existingIntent) {
+      db.exec("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        error: "ONCHAIN_INTENT_ALREADY_EXISTS",
+        message: "This transfer already has an on-chain execution intent.",
+        state: existingIntent.state
+      });
+    }
+
+    const recipientTrust = db.prepare(`
+      SELECT status
+      FROM trusted_recipients
+      WHERE account_id = ?
+        AND network = 'testnet'
+    `).get(transfer.recipient) as
+      | { status: string }
+      | undefined;
+
+    if (recipientTrust?.status === "REVOKED") {
+      db.exec("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        error: "RECIPIENT_TRUST_REVOKED"
+      });
+    }
+
+    if (
+      transfer.policy_decision === "ALLOW" &&
+      transfer.status === "AUTHORIZED"
+    ) {
+      if (recipientTrust?.status !== "ACTIVE") {
+        db.exec("ROLLBACK");
+        return res.status(403).json({
+          success: false,
+          error: "ACTIVE_TRUST_REQUIRED",
+          message: "Autonomous on-chain execution requires an active trusted recipient."
+        });
+      }
+    } else if (
+      transfer.policy_decision === "REQUIRES_APPROVAL" &&
+      transfer.status === "APPROVED"
+    ) {
+      const approval = db.prepare(`
+        SELECT
+          id,
+          status,
+          amount_yocto,
+          currency,
+          recipient
+        FROM approvals
+        WHERE transfer_id = ?
+      `).get(transferId) as
+        | {
+            id: number;
+            status: string;
+            amount_yocto: string | null;
+            currency: string;
+            recipient: string;
+          }
+        | undefined;
+
+      if (
+        !approval ||
+        approval.status !== "APPROVED" ||
+        approval.amount_yocto !== transfer.amount_yocto ||
+        approval.currency !== transfer.currency ||
+        approval.recipient !== transfer.recipient
+      ) {
+        db.exec("ROLLBACK");
+        return res.status(403).json({
+          success: false,
+          error: "MATCHING_APPROVAL_REQUIRED",
+          message: "A linked, approved record with matching amount, currency and recipient is required."
+        });
+      }
+    } else {
+      db.exec("ROLLBACK");
+      return res.status(403).json({
+        success: false,
+        error: "TRANSFER_NOT_AUTHORIZED",
+        message: "The transfer is blocked, pending approval, rejected, or otherwise unauthorized."
+      });
+    }
+
+    db.prepare(`
+      INSERT INTO onchain_executions (
+        intent_id,
+        transfer_id,
+        sender_account_id,
+        recipient,
+        amount_yocto,
+        state,
+        expires_at
+      )
+      VALUES (?, ?, ?, ?, ?, 'CREATED', ?)
+    `).run(
+      intentId,
+      transferId,
+      senderAccountId,
+      transfer.recipient,
+      transfer.amount_yocto,
+      expiresAt
+    );
+
+    db.prepare(`
+      INSERT INTO audit_events (event_type, details)
+      VALUES (?, ?)
+    `).run(
+      "ONCHAIN_EXECUTION_INTENT_CREATED",
+      JSON.stringify({
+        intentId,
+        transferId,
+        network: "testnet",
+        senderAccountId,
+        recipient: transfer.recipient,
+        amountYocto: transfer.amount_yocto,
+        expiresAt
+      })
+    );
+
+    db.exec("COMMIT");
+
+    return res.status(201).json({
+      success: true,
+      network: "testnet",
+      intent: {
+        intentId,
+        transferId,
+        senderAccountId,
+        receiverId: transfer.recipient,
+        amountYocto: transfer.amount_yocto,
+        expiresAt,
+        state: "CREATED"
+      },
+      transaction: {
+        network: "testnet",
+        signerId: senderAccountId,
+        receiverId: transfer.recipient,
+        actions: [{
+          type: "Transfer",
+          params: {
+            deposit: transfer.amount_yocto
+          }
+        }]
+      },
+      message: "Execution intent created. No wallet signature or transaction submission has occurred."
+    });
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+});
+
+// ---- independently verified NEAR Testnet submission -----------------------
+
+function isBase58NearTransactionHash(value: unknown): value is string {
+  return typeof value === "string" &&
+    /^[1-9A-HJ-NP-Za-km-z]{43,44}$/.test(value);
+}
+
+function asNearRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function isNearSuccessfulOutcome(value: unknown): boolean {
+  const outcome = asNearRecord(value);
+  if (!outcome) return false;
+
+  const keys = Object.keys(outcome);
+  if (keys.length !== 1) return false;
+
+  const statusKey = keys[0];
+
+  return (
+    (statusKey === "SuccessValue" || statusKey === "SuccessReceiptId") &&
+    typeof outcome[statusKey] === "string"
+  );
+}
+
+app.post("/api/onchain-executions/:intentId/submit", async (req, res) => {
+  const intentId =
+    typeof req.params.intentId === "string"
+      ? req.params.intentId.trim()
+      : "";
+  const txHash = req.body?.txHash;
+
+  if (!intentId || intentId.length > 80) {
+    return res.status(400).json({
+      success: false,
+      error: "INVALID_INTENT_ID"
+    });
+  }
+
+  if (!isBase58NearTransactionHash(txHash)) {
+    return res.status(400).json({
+      success: false,
+      error: "INVALID_TRANSACTION_HASH",
+      message: "Provide a valid 43â€“44 character Base58 NEAR transaction hash."
+    });
+  }
+
+  type OnchainIntentRow = {
+    intent_id: string;
+    transfer_id: number;
+    tx_hash: string | null;
+    sender_account_id: string;
+    recipient: string;
+    amount_yocto: string;
+    state: string;
+    expires_at: string;
+  };
+
+  let intent: OnchainIntentRow | undefined;
+
+  // Bind the transaction hash exactly once before contacting the RPC.
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    intent = db.prepare(`
+      SELECT intent_id, transfer_id, tx_hash, sender_account_id,
+             recipient, amount_yocto, state, expires_at
+      FROM onchain_executions
+      WHERE intent_id = ?
+    `).get(intentId) as OnchainIntentRow | undefined;
+
+    if (!intent) {
+      db.exec("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        error: "ONCHAIN_INTENT_NOT_FOUND"
+      });
+    }
+
+    if (intent.state === "CREATED") {
+      if (Date.parse(intent.expires_at) <= Date.now()) {
+        db.prepare(`
+          UPDATE onchain_executions
+          SET state = 'EXPIRED', failure_code = 'INTENT_EXPIRED'
+          WHERE intent_id = ? AND state = 'CREATED'
+        `).run(intentId);
+
+        db.prepare(`
+          INSERT INTO audit_events (event_type, details)
+          VALUES (?, ?)
+        `).run(
+          "ONCHAIN_EXECUTION_INTENT_EXPIRED",
+          JSON.stringify({ intentId, transferId: intent.transfer_id })
+        );
+
+        db.exec("COMMIT");
+        return res.status(410).json({
+          success: false,
+          error: "ONCHAIN_INTENT_EXPIRED"
+        });
+      }
+
+      db.prepare(`
+        UPDATE onchain_executions
+        SET tx_hash = ?, state = 'SUBMITTED', submitted_at = CURRENT_TIMESTAMP
+        WHERE intent_id = ? AND state = 'CREATED' AND tx_hash IS NULL
+      `).run(txHash, intentId);
+
+      db.prepare(`
+        INSERT INTO audit_events (event_type, details)
+        VALUES (?, ?)
+      `).run(
+        "ONCHAIN_TRANSACTION_HASH_RECEIVED",
+        JSON.stringify({
+          intentId,
+          transferId: intent.transfer_id,
+          txHash,
+          senderAccountId: intent.sender_account_id
+        })
+      );
+
+      intent.tx_hash = txHash;
+      intent.state = "SUBMITTED";
+
+    } else if (intent.state === "EXPIRED") {
+      db.exec("COMMIT");
+      return res.status(410).json({
+        success: false,
+        error: "ONCHAIN_INTENT_EXPIRED"
+      });
+    } else if (intent.tx_hash !== txHash) {
+      db.exec("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        error: "TRANSACTION_HASH_MISMATCH",
+        message: "This intent is permanently bound to its original transaction hash."
+      });
+    } else if (intent.state === "VERIFIED") {
+      db.exec("COMMIT");
+      return res.json({
+        success: true,
+        intentId,
+        txHash,
+        state: "VERIFIED",
+        onchainConfirmed: true,
+        idempotent: true
+      });
+    } else if (intent.state === "FAILED") {
+      db.exec("COMMIT");
+      return res.status(409).json({
+        success: false,
+        error: "ONCHAIN_EXECUTION_FAILED",
+        state: "FAILED"
+      });
+
+    } else if (intent.state !== "SUBMITTED") {
+      db.exec("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        error: "INVALID_ONCHAIN_EXECUTION_STATE"
+      });
+    }
+
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+
+  // Never hold a SQLite write transaction open during network I/O.
+  let rpcData: Record<string, unknown>;
+
+  try {
+    const rpcResponse = await fetch(NEAR_TESTNET_TX_RPC_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "warden-testnet-finality-verification",
+        method: "tx",
+        params: {
+          tx_hash: txHash,
+          sender_account_id: intent.sender_account_id,
+          wait_until: "FINAL"
+        }
+      }),
+      signal: AbortSignal.timeout(15000)
+    });
+
+    if (!rpcResponse.ok) {
+      return res.status(502).json({
+        success: false,
+        error: "NEAR_TX_RPC_HTTP_ERROR",
+        state: "SUBMITTED",
+        retryable: true
+      });
+    }
+
+    const parsed: unknown = await rpcResponse.json();
+    const parsedRecord = asNearRecord(parsed);
+
+    if (!parsedRecord || parsedRecord.error) {
+      return res.status(502).json({
+        success: false,
+        error: "NEAR_TX_RPC_ERROR",
+        state: "SUBMITTED",
+        retryable: true
+      });
+    }
+
+    const resultRecord = asNearRecord(parsedRecord.result);
+    if (!resultRecord) {
+      return res.status(502).json({
+        success: false,
+        error: "INVALID_NEAR_TX_RPC_RESPONSE",
+        state: "SUBMITTED",
+        retryable: true
+      });
+    }
+
+    rpcData = resultRecord;
+  } catch {
+    return res.status(502).json({
+      success: false,
+      error: "NEAR_TX_RPC_UNAVAILABLE",
+      state: "SUBMITTED",
+      retryable: true
+    });
+  }
+
+  if (rpcData.final_execution_status !== "FINAL") {
+    return res.status(202).json({
+      success: true,
+      intentId,
+      txHash,
+      state: "SUBMITTED",
+      onchainConfirmed: false,
+      message: "The transaction has not reached finality. Retry verification with the same hash."
+    });
+  }
+
+  const transaction = asNearRecord(rpcData.transaction);
+  const transactionOutcome = asNearRecord(rpcData.transaction_outcome);
+  const transactionOutcomeDetails =
+    asNearRecord(transactionOutcome?.outcome);
+  const receipts = rpcData.receipts_outcome;
+
+  const actions =
+    transaction && Array.isArray(transaction.actions)
+      ? transaction.actions
+      : [];
+
+  const firstAction = asNearRecord(actions[0]);
+  const transferAction = asNearRecord(firstAction?.Transfer);
+
+  const transactionMatches =
+    transaction !== null &&
+    transaction.hash === txHash &&
+    transaction.signer_id === intent.sender_account_id &&
+    transaction.receiver_id === intent.recipient &&
+    actions.length === 1 &&
+    firstAction !== null &&
+    Object.keys(firstAction).length === 1 &&
+    transferAction !== null &&
+    transferAction.deposit === intent.amount_yocto;
+
+  const outcomesSucceeded =
+    isNearSuccessfulOutcome(transactionOutcomeDetails?.status) &&
+    isNearSuccessfulOutcome(rpcData.status) &&
+    Array.isArray(receipts) &&
+    receipts.length > 0 &&
+    receipts.every(receipt => {
+      const receiptRecord = asNearRecord(receipt);
+      const outcome = asNearRecord(receiptRecord?.outcome);
+      return isNearSuccessfulOutcome(outcome?.status);
+    });
+
+  const failureCode = !transactionMatches
+    ? "TRANSACTION_INTENT_MISMATCH"
+    : !outcomesSucceeded
+      ? "TRANSACTION_EXECUTION_FAILED"
+      : null;
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const current = db.prepare(`
+      SELECT state, tx_hash
+      FROM onchain_executions
+      WHERE intent_id = ?
+    `).get(intentId) as { state: string; tx_hash: string | null } | undefined;
+
+    if (!current || current.tx_hash !== txHash) {
+      db.exec("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        error: "ONCHAIN_EXECUTION_STATE_CHANGED"
+      });
+    }
+
+    if (current.state === "VERIFIED") {
+      db.exec("COMMIT");
+      return res.json({
+        success: true,
+        intentId,
+        txHash,
+        state: "VERIFIED",
+        onchainConfirmed: true,
+        idempotent: true
+      });
+    }
+
+    if (current.state === "FAILED") {
+      db.exec("COMMIT");
+      return res.status(409).json({
+        success: false,
+        error: "ONCHAIN_EXECUTION_FAILED",
+        state: "FAILED"
+      });
+    }
+
+    if (current.state !== "SUBMITTED") {
+      db.exec("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        error: "INVALID_ONCHAIN_EXECUTION_STATE"
+      });
+    }
+
+    const finalState = failureCode ? "FAILED" : "VERIFIED";
+
+    db.prepare(`
+      UPDATE onchain_executions
+      SET state = ?, failure_code = ?, finalized_at = CURRENT_TIMESTAMP
+      WHERE intent_id = ? AND state = 'SUBMITTED' AND tx_hash = ?
+    `).run(finalState, failureCode, intentId, txHash);
+
+    db.prepare(`
+      INSERT INTO audit_events (event_type, details)
+      VALUES (?, ?)
+    `).run(
+      failureCode
+        ? "ONCHAIN_EXECUTION_VERIFICATION_FAILED"
+        : "ONCHAIN_EXECUTION_VERIFIED",
+      JSON.stringify({
+        intentId,
+        transferId: intent.transfer_id,
+        txHash,
+        state: finalState,
+        failureCode,
+        senderAccountId: intent.sender_account_id,
+        recipient: intent.recipient,
+        amountYocto: intent.amount_yocto
+      })
+    );
+
+    db.exec("COMMIT");
+
+    if (failureCode) {
+      return res.status(409).json({
+        success: false,
+        intentId,
+        txHash,
+        state: "FAILED",
+        error: failureCode,
+        onchainConfirmed: false
+      });
+    }
+
+    return res.json({
+      success: true,
+      intentId,
+      transferId: intent.transfer_id,
+      txHash,
+      network: "testnet",
+      state: "VERIFIED",
+      onchainConfirmed: true,
+      message: "NEAR Testnet transaction independently verified at finality."
+    });
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+});
 // Simulation-only execution gate.
 // This endpoint never submits a real NEAR transaction.
 app.post("/api/transfers/:id/simulate-execution", (req, res) => {
