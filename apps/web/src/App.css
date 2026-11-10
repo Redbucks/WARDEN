@@ -1176,3 +1176,298 @@ td small {
   line-height: 1.35;
   max-width: 260px;
 }
+
+/* WARDEN authenticated operator login */
+.auth-screen {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  padding: 28px 18px;
+  background:
+    radial-gradient(ellipse at 50% 0%, #183052 0%, transparent 48%),
+    #080f1b;
+}
+
+.auth-card {
+  width: min(100%, 440px);
+  padding: 34px;
+  border: 1px solid #263b58;
+  border-radius: 12px;
+  background: #101b2b;
+  box-shadow: 0 24px 70px #00000055;
+}
+
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 42px;
+}
+
+.auth-brand-mark {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border: 1px solid #4169a2;
+  border-radius: 9px;
+  background: #1b3455;
+  color: #9fc4ff;
+}
+
+.auth-brand-name {
+  color: #edf3fc;
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: 2px;
+}
+
+.auth-brand-caption {
+  margin-top: 3px;
+  color: #8496b0;
+  font-size: 9px;
+  letter-spacing: 1.1px;
+}
+
+.auth-eyebrow {
+  color: #70b5ff;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+}
+
+.auth-card h1 {
+  margin: 10px 0;
+  color: #edf3fc;
+  font-size: 27px;
+  letter-spacing: -.5px;
+}
+
+.auth-description {
+  margin: 0 0 26px;
+  color: #9aaac0;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.auth-form {
+  display: grid;
+  gap: 11px;
+}
+
+.auth-form label {
+  color: #cbd7e8;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.auth-form input {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid #344966;
+  border-radius: 6px;
+  outline: none;
+  background: #0b1422;
+  color: #edf3fc;
+  font: inherit;
+  font-size: 13px;
+}
+
+.auth-form input:focus {
+  border-color: #6ca8f4;
+  box-shadow: 0 0 0 3px #6ca8f422;
+}
+
+.auth-submit {
+  min-height: 44px;
+  margin-top: 7px;
+  border: 1px solid #477fc5;
+  border-radius: 6px;
+  background: #24548b;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.auth-submit:hover:not(:disabled) {
+  background: #2e67a6;
+}
+
+.auth-submit:disabled {
+  opacity: .6;
+  cursor: wait;
+}
+
+.auth-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #74404b;
+  border-radius: 6px;
+  background: #351d29;
+  color: #ffb8c2;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.auth-error svg {
+  flex: 0 0 auto;
+}
+
+.auth-security-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 22px;
+  color: #91a4bd;
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.auth-security-note svg {
+  flex: 0 0 auto;
+  color: #72cba6;
+}
+
+.auth-mode-note {
+  margin-top: 25px;
+  padding-top: 16px;
+  border-top: 1px solid #26384f;
+  color: #73869f;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-align: center;
+}
+
+@media (max-width: 480px) {
+  .auth-card {
+    padding: 25px 20px;
+  }
+
+  .auth-brand {
+    margin-bottom: 32px;
+  }
+}
+/* WARDEN operator logout */
+.auth-logout {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 11px;
+  border: 1px solid #344966;
+  border-radius: 6px;
+  background: #111e30;
+  color: #b8c8dc;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.auth-logout:hover {
+  border-color: #a65c68;
+  background: #351d29;
+  color: #ffc0c8;
+}
+
+.auth-logout:focus-visible {
+  outline: 2px solid #6ca8f4;
+  outline-offset: 2px;
+}
+
+@media (max-width: 600px) {
+  .auth-logout {
+    padding: 0 8px;
+    font-size: 10px;
+  }
+}
+/* WARDEN transfer proposal form */
+.proposal-description {
+  margin: -5px 0 20px;
+  color: #91a4bd;
+  font-size: 12px;
+  line-height: 1.7;
+  max-width: 760px;
+}
+
+.proposal-form {
+  display: grid;
+  gap: 17px;
+}
+
+.proposal-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 0.7fr) minmax(0, 1.3fr);
+  gap: 15px;
+}
+
+.proposal-fields label {
+  display: grid;
+  gap: 8px;
+  color: #cbd7e8;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.proposal-fields input {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid #344966;
+  border-radius: 6px;
+  outline: none;
+  background: #0b1422;
+  color: #edf3fc;
+  font: inherit;
+  font-size: 13px;
+}
+
+.proposal-fields input:focus {
+  border-color: #6ca8f4;
+  box-shadow: 0 0 0 3px #6ca8f422;
+}
+
+.proposal-fields input:disabled {
+  opacity: .6;
+  cursor: wait;
+}
+
+.proposal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.proposal-footer > span {
+  color: #8294ad;
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.proposal-submit {
+  min-width: 220px;
+  padding: 0 16px;
+}
+
+@media (max-width: 650px) {
+  .proposal-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .proposal-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .proposal-submit {
+    width: 100%;
+  }
+}

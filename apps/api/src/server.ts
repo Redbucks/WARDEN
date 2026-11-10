@@ -1,4 +1,5 @@
-﻿import express from "express";
+import express from "express";
+import { timingSafeEqual } from "node:crypto";
 import cors from "cors";
 import dotenv from "dotenv";
 import { evaluateTransferPolicy, parseNearAmount } from "./policy/PolicyEngine.js";
@@ -15,7 +16,52 @@ app.use(cors({
   origin: process.env.WEB_ORIGIN ?? "http://localhost:5173"
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: "32kb" }));
+
+const API_TOKEN = process.env.WARDEN_API_TOKEN ?? "";
+const API_REVIEWER = process.env.WARDEN_REVIEWER?.trim() || "WARDEN Operator";
+
+if (API_TOKEN.length < 32) {
+  throw new Error(
+    "WARDEN_API_TOKEN is required and must contain at least 32 characters."
+  );
+}
+
+function requireApiToken(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  // Health is intentionally public for local monitoring.
+  if (req.method === "GET" && req.path === "/health") {
+    return next();
+  }
+
+  const authorization = req.get("authorization") ?? "";
+  const suppliedToken = authorization.startsWith("Bearer ")
+    ? authorization.slice(7)
+    : "";
+
+  const expected = Buffer.from(API_TOKEN, "utf8");
+  const supplied = Buffer.from(suppliedToken, "utf8");
+
+  const valid =
+    supplied.length === expected.length &&
+    timingSafeEqual(supplied, expected);
+
+  if (!valid) {
+    return res.status(401).json({
+      success: false,
+      error: "UNAUTHORIZED",
+      message: "A valid WARDEN API token is required."
+    });
+  }
+
+  return next();
+}
+
+// Protect every API route except GET /api/health.
+app.use("/api", requireApiToken);
 
 const dataDirectory = join(process.cwd(), "data");
 mkdirSync(dataDirectory, { recursive: true });
@@ -626,10 +672,7 @@ app.post("/api/approvals/:id/decision", (req, res) => {
   const approvalId = Number(req.params.id);
   const decision = req.body?.decision;
 
-  const reviewer =
-    typeof req.body?.reviewer === "string"
-      ? req.body.reviewer.trim()
-      : "";
+  const reviewer = API_REVIEWER;
 
   if (!Number.isSafeInteger(approvalId) || approvalId <= 0) {
     return res.status(400).json({
@@ -645,12 +688,6 @@ app.post("/api/approvals/:id/decision", (req, res) => {
     });
   }
 
-  if (!reviewer || reviewer.length > 100) {
-    return res.status(400).json({
-      success: false,
-      error: "INVALID_REVIEWER"
-    });
-  }
 
   const status =
     decision === "APPROVE" ? "APPROVED" : "REJECTED";
@@ -676,6 +713,15 @@ app.post("/api/approvals/:id/decision", (req, res) => {
       });
     }
 
+    if (approval.transfer_id === null) {
+      db.exec("ROLLBACK");
+
+      return res.status(409).json({
+        success: false,
+        error: "UNLINKED_APPROVAL",
+        message: "This legacy approval is not linked to a transfer and cannot be decided."
+      });
+    }
     db.prepare(`
       UPDATE approvals
       SET status = ?,

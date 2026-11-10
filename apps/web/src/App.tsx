@@ -100,16 +100,35 @@ type AuditEvent = {
   created_at: string
 }
 
-async function apiRequest<T>(path: string, options?: RequestInit): Promise<T> {
+class ApiAuthError extends Error {
+  constructor() {
+    super('WARDEN authentication is required or the session has expired.')
+    this.name = 'ApiAuthError'
+  }
+}
+
+async function apiRequest<T>(
+  path: string,
+  tokenOrOptions?: string | RequestInit,
+  requestOptions?: RequestInit,
+): Promise<T> {
+  const token = typeof tokenOrOptions === 'string' ? tokenOrOptions : ''
+  const options = typeof tokenOrOptions === 'string' ? requestOptions : tokenOrOptions
+
   const response = await fetch(`${API_BASE}${path}`, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
       ...options?.headers,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
   })
 
   const data = await response.json()
+
+  if (response.status === 401) {
+    throw new ApiAuthError()
+  }
 
   if (!response.ok) {
     throw new Error(data.message || data.error || `Request failed (${response.status})`)
@@ -163,40 +182,70 @@ function App() {
   const [walletError, setWalletError] = useState('')
   const [testnetWalletCount, setTestnetWalletCount] = useState(0)
   const [nearAccountSnapshot, setNearAccountSnapshot] = useState<NearAccountSnapshot | null>(null)
-  const [nearRpcBusy, setNearRpcBusy] = useState(false)
   const [nearRpcError, setNearRpcError] = useState('')
+  const [apiToken, setApiToken] = useState('')
+  const [tokenInput, setTokenInput] = useState('')
+  const [authBusy, setAuthBusy] = useState(false)
+  const [authError, setAuthError] = useState('')
+  const [proposalAmount, setProposalAmount] = useState('')
+  const [proposalRecipient, setProposalRecipient] = useState('')
+  const [proposalBusy, setProposalBusy] = useState(false)
 
-  async function verifyNearAccount(accountId: string) {
-    setNearRpcBusy(true)
-    setNearRpcError('')
+  const nearRpcBusy = Boolean(apiToken && walletConnection?.accountId && !nearAccountSnapshot && !nearRpcError)
+
+  const clearAuthenticatedSession = useCallback((message: string) => {
+    setApiToken('')
+    setTokenInput('')
+    setTransfers([])
+    setApprovals([])
+    setExecutions([])
+    setEvents([])
+    setHealth(null)
+    setError('')
+    setNotice('')
     setNearAccountSnapshot(null)
+    setNearRpcError('')
+    setAuthError(message)
+  }, [])
+
+  async function authenticateApi() {
+    const candidate = tokenInput.trim()
+
+    if (!candidate) {
+      setAuthError('Enter your WARDEN API token.')
+      return
+    }
+
+    setAuthBusy(true)
+    setAuthError('')
 
     try {
-      const snapshot = await apiRequest<NearAccountSnapshot>(
-        `/api/near/account/${encodeURIComponent(accountId)}`,
-      )
-
-      if (!snapshot.success || snapshot.accountId !== accountId || snapshot.network !== 'testnet') {
-        throw new Error('The RPC response did not match the connected Testnet account.')
-      }
-
-      setNearAccountSnapshot(snapshot)
+      await apiRequest<{ transfers: Transfer[] }>('/api/transfers', candidate)
+      setApiToken(candidate)
+      setTokenInput('')
+      setError('')
     } catch (err) {
-      setNearRpcError(
-        err instanceof Error ? err.message : 'Unable to verify NEAR Testnet account.',
+      setAuthError(
+        err instanceof ApiAuthError
+          ? 'The API token is invalid. Check it and try again.'
+          : err instanceof Error
+            ? err.message
+            : 'Unable to authenticate with the WARDEN API.',
       )
     } finally {
-      setNearRpcBusy(false)
+      setAuthBusy(false)
     }
   }
+
+
   const loadDashboardData = useCallback(async () => {
     const [healthData, transferData, approvalData, executionData, auditData] =
       await Promise.all([
         apiRequest<Health>('/api/health'),
-        apiRequest<{ transfers: Transfer[] }>('/api/transfers'),
-        apiRequest<{ approvals: Approval[] }>('/api/approvals'),
-        apiRequest<{ executions: Execution[] }>('/api/executions'),
-        apiRequest<{ events: AuditEvent[] }>('/api/audit'),
+        apiRequest<{ transfers: Transfer[] }>('/api/transfers', apiToken),
+        apiRequest<{ approvals: Approval[] }>('/api/approvals', apiToken),
+        apiRequest<{ executions: Execution[] }>('/api/executions', apiToken),
+        apiRequest<{ events: AuditEvent[] }>('/api/audit', apiToken),
       ])
 
     return {
@@ -206,7 +255,7 @@ function App() {
       executionData,
       auditData,
     }
-  }, [])
+  }, [apiToken])
 
   const applyDashboardData = useCallback(
     (data: Awaited<ReturnType<typeof loadDashboardData>>) => {
@@ -225,9 +274,13 @@ function App() {
       const data = await loadDashboardData()
       applyDashboardData(data)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to connect to WARDEN API')
+      if (err instanceof ApiAuthError) {
+        clearAuthenticatedSession('Your WARDEN API session expired. Sign in again.')
+      } else {
+        setError(err instanceof Error ? err.message : 'Unable to connect to WARDEN API')
+      }
     }
-  }, [loadDashboardData, applyDashboardData])
+  }, [loadDashboardData, applyDashboardData, clearAuthenticatedSession])
 
   async function refreshManually() {
     setRefreshing(true)
@@ -239,6 +292,10 @@ function App() {
   }
 
   useEffect(() => {
+    if (!apiToken) {
+      return
+    }
+
     let active = true
 
     const load = () => {
@@ -248,7 +305,11 @@ function App() {
         })
         .catch((err: unknown) => {
           if (active) {
-            setError(err instanceof Error ? err.message : 'Unable to connect to WARDEN API')
+            if (err instanceof ApiAuthError) {
+              clearAuthenticatedSession('Your WARDEN API session expired. Sign in again.')
+            } else {
+              setError(err instanceof Error ? err.message : 'Unable to connect to WARDEN API')
+            }
           }
         })
     }
@@ -260,7 +321,7 @@ function App() {
       active = false
       window.clearInterval(interval)
     }
-  }, [loadDashboardData, applyDashboardData])
+  }, [apiToken, loadDashboardData, applyDashboardData, clearAuthenticatedSession])
 
   useEffect(() => {
     const handleSignIn = (payload: {
@@ -285,7 +346,6 @@ function App() {
       })
       setNearAccountSnapshot(null)
       setNearRpcError('')
-      void verifyNearAccount(payload.accounts[0].accountId)
       setWalletError('')
     }
 
@@ -293,7 +353,7 @@ function App() {
       setWalletConnection(null)
       setNearAccountSnapshot(null)
       setNearRpcError('')
-      setNearRpcBusy(false)
+
       setWalletError('')
     }
 
@@ -319,6 +379,53 @@ function App() {
     }
   }, [])
 
+  useEffect(() => {
+    const accountId = walletConnection?.accountId
+
+    if (!apiToken || !accountId) {
+      return
+    }
+
+    let cancelled = false
+
+    const verify = async () => {
+      try {
+        const snapshot = await apiRequest<NearAccountSnapshot>(
+          `/api/near/account/${encodeURIComponent(accountId)}`,
+          apiToken,
+        )
+
+        if (cancelled) return
+
+        if (
+          !snapshot.success ||
+          snapshot.accountId !== accountId ||
+          snapshot.network !== 'testnet'
+        ) {
+          throw new Error('The RPC response did not match the connected Testnet account.')
+        }
+
+        setNearAccountSnapshot(snapshot)
+      } catch (err) {
+        if (cancelled) return
+
+        if (err instanceof ApiAuthError) {
+          clearAuthenticatedSession('Your WARDEN API session expired. Sign in again.')
+        } else {
+          setNearRpcError(
+            err instanceof Error ? err.message : 'Unable to verify NEAR Testnet account.',
+          )
+        }
+      }
+    }
+
+    void verify()
+
+    return () => {
+      cancelled = true
+    }
+  }, [apiToken, walletConnection?.accountId, clearAuthenticatedSession])
+
   const pendingApprovals = useMemo(
     () => approvals.filter((item) => item.status === 'PENDING'),
     [approvals],
@@ -337,20 +444,79 @@ function App() {
     setError('')
 
     try {
-      await apiRequest(`/api/approvals/${id}/decision`, {
-        method: 'POST',
-        body: JSON.stringify({
-          decision,
-          reviewer: 'WARDEN Demo Reviewer',
-        }),
-      })
+      await apiRequest(
+        `/api/approvals/${id}/decision`,
+        apiToken,
+        {
+          method: 'POST',
+          body: JSON.stringify({ decision }),
+        },
+      )
 
       setNotice(`Approval #${id} ${decision === 'APPROVE' ? 'approved' : 'rejected'}. No transfer was executed.`)
       await refreshManually()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Approval decision failed')
+      if (err instanceof ApiAuthError) {
+        clearAuthenticatedSession('Your WARDEN API session expired. Sign in again.')
+      } else {
+        setError(err instanceof Error ? err.message : 'Approval decision failed')
+      }
     } finally {
       setBusyApproval(null)
+    }
+  }
+
+  async function submitTransferProposal(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+
+    const amount = proposalAmount.trim()
+    const recipient = proposalRecipient.trim().toLowerCase()
+
+    if (!amount || !recipient || !/^\d+(\.\d+)?$/.test(amount) || Number(amount) <= 0) {
+      setError('Enter a valid positive NEAR amount and recipient account.')
+      return
+    }
+
+    setProposalBusy(true)
+    setError('')
+    setNotice('')
+
+    try {
+      const result = await apiRequest<{
+        success: boolean
+        transferId: number
+        approvalId: number | null
+        policy: {
+          decision: string
+          reasonCode: string
+        }
+        transferStatus: string
+      }>('/api/policy/evaluate', apiToken, {
+        method: 'POST',
+        body: JSON.stringify({
+          amount,
+          currency: 'NEAR',
+          recipient,
+        }),
+      })
+
+      const approvalMessage = result.approvalId
+        ? ` Approval #${result.approvalId} was created for review.`
+        : ''
+
+      setNotice(
+        `Transfer #${result.transferId}: ${result.policy.decision.replaceAll('_', ' ')} (${result.policy.reasonCode}).${approvalMessage} No funds were moved.`,
+      )
+      setProposalAmount('')
+      await refreshManually()
+    } catch (err) {
+      if (err instanceof ApiAuthError) {
+        clearAuthenticatedSession('Your WARDEN API session expired. Sign in again.')
+      } else {
+        setError(err instanceof Error ? err.message : 'Transfer proposal failed.')
+      }
+    } finally {
+      setProposalBusy(false)
     }
   }
 
@@ -411,6 +577,69 @@ function App() {
     } finally {
       setWalletBusy(false)
     }
+  }
+  if (!apiToken) {
+    return (
+      <main className="auth-screen">
+        <section className="auth-card">
+          <div className="auth-brand">
+            <div className="auth-brand-mark"><Shield size={25} /></div>
+            <div>
+              <div className="auth-brand-name">WARDEN</div>
+              <div className="auth-brand-caption">AUTONOMOUS TREASURY SECURITY</div>
+            </div>
+          </div>
+
+          <div className="auth-eyebrow">SECURE OPERATOR ACCESS</div>
+          <h1>Sign in to WARDEN</h1>
+          <p className="auth-description">
+            Enter the API access token configured by your WARDEN administrator
+            to open the treasury control centre.
+          </p>
+
+          <form
+            className="auth-form"
+            onSubmit={(event) => {
+              event.preventDefault()
+              void authenticateApi()
+            }}
+          >
+            <label htmlFor="warden-api-token">API access token</label>
+            <input
+              id="warden-api-token"
+              type="password"
+              autoComplete="off"
+              spellCheck={false}
+              value={tokenInput}
+              onChange={(event) => setTokenInput(event.target.value)}
+              placeholder="Enter your WARDEN API token"
+              required
+              disabled={authBusy}
+            />
+
+            {authError && (
+              <div className="auth-error" role="alert">
+                <ShieldAlert size={16} />
+                <span>{authError}</span>
+              </div>
+            )}
+
+            <button className="auth-submit" type="submit" disabled={authBusy}>
+              {authBusy ? 'Verifying access…' : 'Access control centre'}
+            </button>
+          </form>
+
+          <div className="auth-security-note">
+            <LockKeyhole size={15} />
+            <span>Your token is held in memory only and is not saved in browser storage.</span>
+          </div>
+
+          <div className="auth-mode-note">
+            WARDEN MVP · TEST ENVIRONMENT · SIMULATION ONLY
+          </div>
+        </section>
+      </main>
+    )
   }
   return (
     <div className="app-shell">
@@ -508,6 +737,15 @@ function App() {
               <Bell size={18} />
             </button>
             <div className="avatar">W</div>
+            <button
+              className="auth-logout"
+              type="button"
+              onClick={() => clearAuthenticatedSession('You have signed out of WARDEN.')}
+              title="Sign out of WARDEN"
+            >
+              <LockKeyhole size={14} />
+              Sign out
+            </button>
           </div>
         </header>
 
@@ -625,6 +863,61 @@ function App() {
             </div>
           </section>
 
+          <section className="panel proposal-panel" id="new-transfer">
+            <div className="panel-heading">
+              <div>
+                <div className="eyebrow">POLICY-GATED REQUEST</div>
+                <h2>Create transfer proposal</h2>
+              </div>
+              <span className="count-tag">NEAR TESTNET</span>
+            </div>
+
+            <p className="proposal-description">
+              Submit a transfer request for WARDEN policy evaluation. Recipient
+              verification and approval requirements are checked by the backend.
+              This form does not sign or execute blockchain transactions.
+            </p>
+
+            <form className="proposal-form" onSubmit={(event) => void submitTransferProposal(event)}>
+              <div className="proposal-fields">
+                <label>
+                  Amount (NEAR)
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    placeholder="e.g. 0.005"
+                    value={proposalAmount}
+                    onChange={(event) => setProposalAmount(event.target.value)}
+                    maxLength={50}
+                    required
+                    disabled={proposalBusy}
+                  />
+                </label>
+
+                <label>
+                  Recipient Testnet account
+                  <input
+                    type="text"
+                    placeholder="recipient.testnet"
+                    value={proposalRecipient}
+                    onChange={(event) => setProposalRecipient(event.target.value)}
+                    maxLength={64}
+                    autoComplete="off"
+                    required
+                    disabled={proposalBusy}
+                  />
+                </label>
+              </div>
+
+              <div className="proposal-footer">
+                <span>Policy limits: 0.01 NEAR autonomous · 1 NEAR hard limit</span>
+                <button className="auth-submit proposal-submit" type="submit" disabled={proposalBusy}>
+                  {proposalBusy ? 'Evaluating proposal…' : 'Evaluate transfer proposal'}
+                </button>
+              </div>
+            </form>
+          </section>
+
           <section className="panel" id="approvals">
             <div className="panel-heading">
               <div>
@@ -664,7 +957,7 @@ function App() {
                 </table>
               </div>
             )}
-            <p className="demo-reviewer-note">Demo reviewer identity is currently supplied by the client and is not authenticated.</p>
+            <p className="demo-reviewer-note">Approval decisions are recorded under the server-configured reviewer identity.</p>
           </section>
 
           <section className="panel" id="transfers">

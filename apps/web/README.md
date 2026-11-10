@@ -1,32 +1,47 @@
-# React + TypeScript + Vite
+# WARDEN Web
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+The WARDEN frontend is a React and TypeScript dashboard for autonomous treasury policy monitoring and approval workflows.
 
-Currently, two official plugins are available:
+## Development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Install dependencies:
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```powershell
+npm install
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+Start the Vite development server:
+
+```powershell
+npm run dev
+```
+
+Open `http://localhost:5173`.
+
+The frontend expects the WARDEN API at `http://localhost:3001` by default. Set `VITE_API_URL` to override the API origin if required.
+
+## Available scripts
+
+| Command | Description |
+|---|---|
+| `npm run dev` | Start the Vite development server |
+| `npm run lint` | Run Oxlint |
+| `npm run build` | Run TypeScript checks and create a production build |
+| `npm run preview` | Preview the production build |
+
+## Main features
+
+- API access control using a bearer token entered through the application.
+- NEAR Testnet wallet connection.
+- Read-only NEAR Testnet account verification.
+- Transfer proposal submission and policy evaluation.
+- Approval queue and decision review.
+- Transfer history, audit trail, and simulated execution visibility.
+
+## Security notes
+
+The API token is kept in frontend application memory and is not stored in browser local storage. Do not put API secrets in frontend environment variables, source files, or committed configuration.
+
+Wallet connection and RPC account verification do not mean that a blockchain transaction has been signed or submitted.
+
+WARDEN currently operates in simulation-only mode. No real funds are moved.

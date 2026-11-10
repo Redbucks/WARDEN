@@ -1,4 +1,4 @@
-﻿// Automated tests for the WARDEN simulation execution gate:
+// Automated tests for the WARDEN simulation execution gate:
 //   POST /api/transfers/:id/simulate-execution
 //
 // How it works
@@ -31,6 +31,10 @@ let dbPath: string;
 let baseUrl: string;
 let child: ChildProcess;
 let serverLog = "";
+
+const TEST_API_TOKEN =
+  "warden-integration-test-token-0123456789abcdef";
+const TEST_REVIEWER = "WARDEN Test Operator";
 
 function freePort(): Promise<number> {
   return new Promise((resolvePort, reject) => {
@@ -162,6 +166,8 @@ before(async () => {
     env: {
       ...process.env,
       PORT: String(port),
+      WARDEN_API_TOKEN: TEST_API_TOKEN,
+      WARDEN_REVIEWER: TEST_REVIEWER,
       NEAR_TESTNET_RPC_URL: `http://127.0.0.1:${rpcPort}`
     },
     stdio: ["ignore", "pipe", "pipe"]
@@ -279,8 +285,180 @@ function seedApproval(seed: ApprovalSeed): number {
 
 type SimResult = { status: number; body: Record<string, unknown> };
 
+async function authorizedFetch(
+  url: string,
+  options: RequestInit = {}
+): Promise<Response> {
+  const headers = new Headers(options.headers);
+  headers.set("Authorization", `Bearer ${TEST_API_TOKEN}`);
+
+  return fetch(url, {
+    ...options,
+    headers
+  });
+}
+
+// Verify the GET health endpoint remains public.
+test("API authentication: GET health endpoint is public", async () => {
+  const response = await fetch(`${baseUrl}/api/health`);
+  assert.equal(response.status, 200);
+});
+
+// Verify other methods cannot use the public health bypass.
+test("API authentication: non-GET health requests require a token", async () => {
+  const response = await fetch(`${baseUrl}/api/health`, {
+    method: "POST"
+  });
+
+  assert.equal(response.status, 401);
+
+  const body = await response.json() as Record<string, unknown>;
+  assert.equal(body.success, false);
+  assert.equal(body.error, "UNAUTHORIZED");
+});
+// Verify protected routes reject requests without credentials.
+test("API authentication: protected routes reject missing tokens", async () => {
+  const response = await fetch(`${baseUrl}/api/transfers`);
+
+  assert.equal(response.status, 401);
+
+  const body = await response.json() as Record<string, unknown>;
+  assert.equal(body.success, false);
+  assert.equal(body.error, "UNAUTHORIZED");
+});
+
+// Verify the configured test token grants access.
+test("API authentication: valid token grants access", async () => {
+  const response = await authorizedFetch(`${baseUrl}/api/transfers`);
+
+  assert.equal(response.status, 200);
+});
+
+// Verify an incorrect bearer token cannot access protected routes.
+test("API authentication: invalid token is rejected", async () => {
+  const response = await fetch(`${baseUrl}/api/transfers`, {
+    headers: {
+      Authorization: "Bearer invalid-warden-token-0123456789"
+    }
+  });
+
+  assert.equal(response.status, 401);
+
+  const body = await response.json() as Record<string, unknown>;
+  assert.equal(body.success, false);
+  assert.equal(body.error, "UNAUTHORIZED");
+});
+
+// Verify approval attribution cannot be forged through the request body.
+test("approval security: caller cannot impersonate the configured reviewer", async () => {
+  const transferId = seedTransfer({
+    decision: "REQUIRES_APPROVAL",
+    status: "AWAITING_APPROVAL"
+  });
+
+  const approvalId = seedApproval({
+    transferId,
+    status: "PENDING"
+  });
+
+  const response = await authorizedFetch(
+    `${baseUrl}/api/approvals/${approvalId}/decision`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        decision: "APPROVE",
+        reviewer: "Mallory Unauthorized Reviewer"
+      })
+    }
+  );
+
+  assert.equal(response.status, 200);
+
+  const body = await response.json() as Record<string, unknown>;
+
+  assert.equal(body.success, true);
+  assert.equal(body.status, "APPROVED");
+  assert.equal(body.reviewer, TEST_REVIEWER);
+
+  const stored = withDb(db =>
+    db.prepare(`
+      SELECT status, reviewer
+      FROM approvals
+      WHERE id = ?
+    `).get(approvalId) as { status: string; reviewer: string }
+  );
+
+  assert.equal(stored.status, "APPROVED");
+  assert.equal(stored.reviewer, TEST_REVIEWER);
+  assert.equal(transferStatus(transferId), "APPROVED");
+});
+
+test("approval security: unlinked legacy approval cannot be decided", async () => {
+  const approvalId = withDb(db =>
+    Number(
+      db.prepare(`
+        INSERT INTO approvals
+          (amount, amount_yocto, currency, recipient, reason_code, status, transfer_id)
+        VALUES (5000, NULL, 'USD', 'alice.testnet', 'LEGACY', 'PENDING', NULL)
+      `).run().lastInsertRowid
+    )
+  );
+
+  const auditBefore = withDb(db =>
+    Number((db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM audit_events
+      WHERE event_type = 'APPROVAL_DECIDED'
+    `).get() as { count: number }).count)
+  );
+
+  const response = await authorizedFetch(
+    `${baseUrl}/api/approvals/${approvalId}/decision`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "APPROVE" })
+    }
+  );
+
+  assert.equal(response.status, 409);
+
+  const body = await response.json() as Record<string, unknown>;
+  assert.equal(body.success, false);
+  assert.equal(body.error, "UNLINKED_APPROVAL");
+
+  const stored = withDb(db =>
+    db.prepare(`
+      SELECT status, reviewer, reviewed_at, transfer_id
+      FROM approvals
+      WHERE id = ?
+    `).get(approvalId) as {
+      status: string;
+      reviewer: string | null;
+      reviewed_at: string | null;
+      transfer_id: number | null;
+    }
+  );
+
+  assert.equal(stored.status, "PENDING");
+  assert.equal(stored.reviewer, null);
+  assert.equal(stored.reviewed_at, null);
+  assert.equal(stored.transfer_id, null);
+
+  const auditAfter = withDb(db =>
+    Number((db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM audit_events
+      WHERE event_type = 'APPROVAL_DECIDED'
+    `).get() as { count: number }).count)
+  );
+
+  assert.equal(auditAfter, auditBefore);
+});
+
 async function evaluatePolicy(payload: Record<string, unknown>): Promise<SimResult> {
-  const res = await fetch(`${baseUrl}/api/policy/evaluate`, {
+  const res = await authorizedFetch(`${baseUrl}/api/policy/evaluate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
@@ -292,7 +470,7 @@ async function evaluatePolicy(payload: Record<string, unknown>): Promise<SimResu
   };
 }
 async function simulate(transferId: number): Promise<SimResult> {
-  const res = await fetch(`${baseUrl}/api/transfers/${transferId}/simulate-execution`, {
+  const res = await authorizedFetch(`${baseUrl}/api/transfers/${transferId}/simulate-execution`, {
     method: "POST"
   });
   return { status: res.status, body: (await res.json()) as Record<string, unknown> };
@@ -385,7 +563,7 @@ const APPROVAL_DENIED = { httpStatus: 403, error: "APPROVAL_REQUIRED_OR_MISMATCH
 
 
 async function validateRecipient(recipient: unknown): Promise<SimResult> {
-  const res = await fetch(`${baseUrl}/api/near/validate-recipient`, {
+  const res = await authorizedFetch(`${baseUrl}/api/near/validate-recipient`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ recipient })
@@ -966,7 +1144,7 @@ test("extra: nonexistent transfer returns 404 and invalid id returns 400", async
   assert.equal(missing.status, 404);
   assert.equal(missing.body.error, "TRANSFER_NOT_FOUND");
 
-  const invalid = await fetch(`${baseUrl}/api/transfers/abc/simulate-execution`, { method: "POST" });
+  const invalid = await authorizedFetch(`${baseUrl}/api/transfers/abc/simulate-execution`, { method: "POST" });
   assert.equal(invalid.status, 400);
   assert.equal(((await invalid.json()) as Record<string, unknown>).error, "INVALID_TRANSFER_ID");
 });
