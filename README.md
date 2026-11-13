@@ -172,6 +172,60 @@ WARDEN/
 - npm
 - A NEAR Testnet-compatible wallet for wallet connection and Testnet execution
 
+## How Hackathon Judges Can Run WARDEN
+
+Judges do **not** need the project owner's API token or wallet credentials. Each reviewer running WARDEN locally creates their own API token and uses their own optional NEAR Testnet wallet.
+
+The API token is a local development credential. It is not included in the repository and must never be shared in a submission, issue, screenshot, or demo recording.
+
+### Quick start (Windows PowerShell)
+
+Clone the public repository and open the project folder:
+
+```powershell
+git clone https://github.com/Redbucks/WARDEN.git
+cd WARDEN
+```
+
+**Terminal 1 — API**
+
+```powershell
+cd apps/api
+npm ci
+Copy-Item .env.example .env
+```
+
+Open `apps/api/.env`, replace the example `WARDEN_API_TOKEN` with a unique random secret of at least 32 characters, and save the file. Keep this token private.
+
+Then build and start the API:
+
+```powershell
+npm run build
+npm start
+```
+
+**Terminal 2 — frontend**
+
+From the repository root in a second PowerShell window:
+
+```powershell
+cd apps/web
+npm ci
+npm run dev
+```
+
+Open `http://localhost:5173` and enter the same locally generated API token in WARDEN's access screen.
+
+The API health endpoint is available at `http://localhost:3001/api/health`. Protected API routes require the reviewer's own bearer token.
+
+### Wallet and execution notes
+
+- A judge can inspect the code and run the local application using their own API token; the project owner's token is not required.
+- Connecting a NEAR Testnet-compatible wallet is only needed for wallet-dependent features.
+- Any Testnet transaction requires the reviewer to use their own wallet and explicitly approve the transaction. Never use another person's seed phrase or private key.
+- Simulation is separate from on-chain execution and does not move funds.
+- WARDEN is an experimental Testnet MVP, not a production treasury service.
+
 ## Local setup
 
 ### 1. Configure the API
